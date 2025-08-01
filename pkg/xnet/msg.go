@@ -8,7 +8,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"sync"
+	"sync/atomic"
 )
 
 var zap netip.AddrPort
@@ -22,42 +22,49 @@ type RemoteAddrer interface {
 }
 
 type Msg struct {
+	next *Msg
 	netip.AddrPort
 	Data []byte
 }
 
 type MsgPool struct {
 	mtu int
-	p   *sync.Pool
+	p   atomic.Pointer[Msg]
 }
 
 func NewMsgPool(mtu int) *MsgPool {
 	return &MsgPool{
 		mtu: mtu,
-		p: &sync.Pool{
-			New: func() any {
-				return &Msg{
-					AddrPort: zap,
-					Data:     make([]byte, mtu, mtu),
-				}
-			},
-		},
 	}
 }
 
 func (mp *MsgPool) Get() *Msg {
-	return mp.p.Get().(*Msg)
+	for {
+		m := mp.p.Load()
+		if m == nil {
+			return &Msg{Data: make([]byte, mp.mtu, mp.mtu)}
+		}
+		if mp.p.CompareAndSwap(m, m.next) {
+			m.next = nil
+			return m
+		}
+	}
 }
 
 func (mp *MsgPool) Put(m *Msg) {
-	if cap(m.Data) == mp.mtu {
-		m.AddrPort = zap
-		m.Data = m.Data[:mp.mtu]
-		mp.p.Put(m)
-	} else {
+	m.AddrPort = zap
+	if cap(m.Data) != mp.mtu {
 		// Let GC deal with this.
 		m.Data = m.Data[:0]
 		m = nil
+		return
+	}
+	m.Data = m.Data[:mp.mtu]
+	for {
+		m.next = mp.p.Load()
+		if mp.p.CompareAndSwap(m.next, m) {
+			break
+		}
 	}
 }
 
